@@ -196,6 +196,18 @@ A: 图片元素如果比较多比较复杂，可能会导致不稳定，影响�
 
 </details>
 
+<details>
+<summary><b>Q: 生成图片时提示“网络请求失败：无法连接接口服务”怎么排查？</b></summary>
+
+A: 这是浏览器网络层（跨域 / 证书 / 网络）的错误，不是模型本身的问题，常见两类原因：
+
+1. **HTTPS 证书与域名不一致**：例如接口证书是 `api.xxx.cn`，却在设置里填了 `https://xxx.top`。请在浏览器直接打开接口地址确认，或向服务商确认“API 地址”，必须与证书域名一致。
+2. **接口没有开启 CORS**：纯前端页面直接请求第三方接口时，浏览器会先发 OPTIONS 预检；接口若未返回 `Access-Control-Allow-Origin`，请求会被浏览器直接拦截，控制台通常显示 CORS 或 `Failed to fetch`。
+
+本项目在 `npm run dev` / `vite preview` 下内置了同源反向代理（`/api-proxy`，见 `dev-api-proxy.js`），会自动把请求转发到设置里填写的接口地址，本地开发不需要接口开启 CORS。**部署到服务器（Nginx / Docker）时**，需要在 Web 服务器上为 `/api-proxy/` 配置同样的反向代理（把 `X-Api-Base` 头指定的地址作为上游），否则浏览器仍会因跨域失败。
+
+</details>
+
 ## 贡献指南
 
 我们欢迎各种形式的贡献！

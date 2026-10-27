@@ -14,6 +14,7 @@ import {
 } from './lib/api';
 import { removeImageBackground } from './lib/backgroundRemoval';
 import { extractByMask } from './lib/maskExtraction';
+import { isChatImageModel, migrateLegacySizeConfig, normalizeSizeConfig, resolveOutputSize } from './lib/imageSize';
 
 function App() {
   // 图层管理
@@ -33,15 +34,25 @@ function App() {
   const [apiKey, setApiKey] = useState(() => localStorage.getItem('apiKey') || '');
   const [baseUrl, setBaseUrl] = useState(() => localStorage.getItem('baseUrl') || 'https://foxi-ai.top');
   const [modelName, setModelName] = useState(() => localStorage.getItem('modelName') || 'gemini-2.5-flash-image');
-  const [useGeminiNative, setUseGeminiNative] = useState(() => localStorage.getItem('useGeminiNative') === 'true');
 
   const [mode, setMode] = useState('generate'); // 'generate' | 'edit'
   const [isDrawing, setIsDrawing] = useState(false);
   const [drawMode, setDrawMode] = useState('brush'); // 'brush' | 'rectangle' | 'eraser' | 'select'
   const [brushSize, setBrushSize] = useState(30);
 
-  const [imageSize, setImageSize] = useState(() => localStorage.getItem('imageSize') || '1024x1024');
-  const [aspectRatio, setAspectRatio] = useState(() => localStorage.getItem('aspectRatio') || '1:1');
+  // 输出尺寸：只有一个配置（按比例 / 自定义像素 / 沿用原图），由 SizeControl 统一编辑
+  const [sizeConfig, setSizeConfig] = useState(() => {
+    try {
+      const saved = localStorage.getItem('sizeConfig');
+      if (saved) return normalizeSizeConfig(JSON.parse(saved));
+    } catch {
+      // 旧数据损坏时回退到迁移逻辑
+    }
+    return migrateLegacySizeConfig({
+      imageSize: localStorage.getItem('imageSize'),
+      aspectRatio: localStorage.getItem('aspectRatio'),
+    });
+  });
   const [generateCount, setGenerateCount] = useState(() => {
     const saved = localStorage.getItem('generateCount');
     return saved ? parseInt(saved) : 1;
@@ -71,73 +82,9 @@ function App() {
   const [regions, setRegions] = useState([]);
   const [regionInstructions, setRegionInstructions] = useState({});
 
-  // 计算最大公约数
-  const gcd = (a, b) => {
-    return b === 0 ? a : gcd(b, a % b);
-  };
-
-  // 计算最接近的宽高比
-  const findClosestAspectRatio = (width, height) => {
-    const divisor = gcd(width, height);
-    const ratioW = width / divisor;
-    const ratioH = height / divisor;
-    const ratio = `${ratioW}:${ratioH}`;
-
-    // 预设的宽高比列表
-    const presets = ['1:1', '16:9', '9:16', '4:3', '3:4', '21:9', '9:21', '3:2', '2:3', '5:4', '4:5'];
-
-    // 如果计算出的比例在预设中，直接返回
-    if (presets.includes(ratio)) {
-      return ratio;
-    }
-
-    // 否则找最接近的预设比例
-    const targetRatio = width / height;
-    let closestRatio = '1:1';
-    let minDiff = Math.abs(targetRatio - 1);
-
-    for (const preset of presets) {
-      const [w, h] = preset.split(':').map(Number);
-      const presetRatio = w / h;
-      const diff = Math.abs(targetRatio - presetRatio);
-      if (diff < minDiff) {
-        minDiff = diff;
-        closestRatio = preset;
-      }
-    }
-
-    return closestRatio;
-  };
-
-  // 当选中图层变化时，在编辑模式下自动同步图层尺寸到UI
-  React.useEffect(() => {
-    if (mode === 'edit' && selectedLayerId) {
-      const selectedLayer = layers.find(l => l.id === selectedLayerId);
-      if (selectedLayer && selectedLayer.width && selectedLayer.height) {
-        const { width, height } = selectedLayer;
-
-        // 设置自定义尺寸
-        const customSizeStr = `${width}:${height}`;
-
-        // 检查是否匹配预设尺寸
-        const presetSizes = ['1024x1024', '2048x2048', '4096x4096'];
-        const matchedPreset = presetSizes.find(preset => {
-          const [w, h] = preset.split('x').map(Number);
-          return w === width && h === height;
-        });
-
-        if (matchedPreset) {
-          setImageSize(matchedPreset);
-        } else {
-          setImageSize(customSizeStr);
-        }
-
-        // 计算并设置最接近的宽高比
-        const closestRatio = findClosestAspectRatio(width, height);
-        setAspectRatio(closestRatio);
-      }
-    }
-  }, [selectedLayerId, layers, mode]);
+  // 编辑模式下“沿用原图尺寸”需要知道当前选中图层的像素尺寸
+  const activeLayer = layers.find((layer) => layer.id === selectedLayerId) || null;
+  const sourceSize = activeLayer ? { width: activeLayer.width, height: activeLayer.height } : null;
 
   // 添加新图层
   const addLayer = React.useCallback(async (layerData) => {
@@ -361,11 +308,6 @@ function App() {
     }
   };
 
-  const isChatImageModel = (name) => {
-    // 所有 Gemini 模型和 nano-banana 模型都支持 Chat Completions API
-    return name.startsWith('gemini-') || name.startsWith('nano-banana');
-  };
-
   // 抠图功能
   const handleRemoveBackground = async (layerId) => {
     const layer = layers.find(l => l.id === layerId);
@@ -471,16 +413,8 @@ function App() {
   }, [modelName]);
 
   React.useEffect(() => {
-    localStorage.setItem('imageSize', imageSize);
-  }, [imageSize]);
-
-  React.useEffect(() => {
-    localStorage.setItem('aspectRatio', aspectRatio);
-  }, [aspectRatio]);
-
-  React.useEffect(() => {
-    localStorage.setItem('useGeminiNative', useGeminiNative);
-  }, [useGeminiNative]);
+    localStorage.setItem('sizeConfig', JSON.stringify(sizeConfig));
+  }, [sizeConfig]);
 
   React.useEffect(() => {
     localStorage.setItem('generateCount', generateCount);
@@ -587,6 +521,18 @@ function App() {
           return;
         }
 
+        // 输出尺寸：沿用原图 / 按比例 / 自定义像素，统一由 SizeControl 决定
+        const editOutputSize = resolveOutputSize({
+          config: sizeConfig,
+          model: modelName,
+          mode: 'edit',
+          sourceSize: { width: selectedLayer.width, height: selectedLayer.height },
+        });
+        if (editOutputSize.errors.length > 0) {
+          alert(`输出尺寸不合法：${editOutputSize.errors.join('；')}`);
+          return;
+        }
+
         // 获取图层的 dataUrl
         const imageDataUrl = `data:${selectedLayer.mimeType};base64,${selectedLayer.base64}`;
 
@@ -617,15 +563,14 @@ function App() {
             apiKey,
             baseUrl,
             model: modelName,
-            useGeminiNative, // 添加 Gemini 原生格式支持
             referenceImages, // 添加参考图
-            aspectRatio, // 添加宽高比
-            imageSize, // 添加图片尺寸
+            aspectRatio: editOutputSize.aspectRatio,
+            imageSize: editOutputSize.imageSize,
           });
           resultDataUrl = `data:${result.mimeType};base64,${result.base64}`;
         } else {
           if (!hasMask) {
-            alert('当前模型仅支持有遮罩的编辑，请先绘制遮罩区域');
+            alert('当前模型在编辑模式下需要先绘制遮罩：请涂抹或框选要修改的区域（无遮罩的整图编辑暂未接入）');
             return;
           }
           const result = await editImage({
@@ -636,6 +581,7 @@ function App() {
             baseUrl,
             model: modelName,
             imageMimeType: selectedLayer.mimeType,
+            size: editOutputSize.pixelSize,
           });
           const firstImage = result?.data?.[0];
           if (!firstImage?.b64_json) throw new Error('编辑失败：未返回图片数据');
@@ -643,8 +589,19 @@ function App() {
         }
       } else {
         // 生成模式：批量生成新图片
-        const count = mode === 'generate' ? generateCount : 1;
+        const count = generateCount;
         const generatedImages = [];
+
+        // 输出尺寸：按比例 / 自定义像素（生成模式没有“沿用原图”选项）
+        const outputSize = resolveOutputSize({
+          config: sizeConfig,
+          model: modelName,
+          mode: 'generate',
+        });
+        if (outputSize.errors.length > 0) {
+          alert(`输出尺寸不合法：${outputSize.errors.join('；')}`);
+          return;
+        }
 
         for (let i = 0; i < count; i++) {
           if (isChatImageModel(modelName)) {
@@ -653,9 +610,8 @@ function App() {
               apiKey,
               baseUrl,
               model: modelName,
-              aspectRatio,
-              imageSize,
-              useGeminiNative,
+              aspectRatio: outputSize.aspectRatio,
+              imageSize: outputSize.imageSize,
               referenceImages, // 添加参考图
             });
             generatedImages.push(`data:${result.mimeType};base64,${result.base64}`);
@@ -665,9 +621,7 @@ function App() {
               apiKey,
               baseUrl,
               model: modelName,
-              size: imageSize,
-              aspectRatio,
-              useGeminiNative,
+              size: outputSize.pixelSize,
             });
             const firstImage = result?.data?.[0];
             if (!firstImage?.b64_json) throw new Error('生成失败：未返回图片数据');
@@ -954,14 +908,11 @@ function App() {
           setBaseUrl={setBaseUrl}
           modelName={modelName}
           setModelName={setModelName}
-          useGeminiNative={useGeminiNative}
-          setUseGeminiNative={setUseGeminiNative}
           mode={mode}
           setMode={setMode}
-          imageSize={imageSize}
-          setImageSize={setImageSize}
-          aspectRatio={aspectRatio}
-          setAspectRatio={setAspectRatio}
+          sizeConfig={sizeConfig}
+          setSizeConfig={setSizeConfig}
+          sourceSize={sourceSize}
           generateCount={generateCount}
           setGenerateCount={setGenerateCount}
           regions={regions}

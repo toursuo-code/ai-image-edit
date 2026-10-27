@@ -1,5 +1,7 @@
 import React from 'react';
 import { Button } from './ui/Button';
+import { SizeControl } from './SizeControl';
+import { resolveOutputSize } from '../lib/imageSize';
 import { Settings, Sparkles, Image as ImageIcon, Type, X, Plus, Trash2 } from 'lucide-react';
 import { cn } from '../lib/utils';
 
@@ -14,14 +16,11 @@ export function ControlPanel({
     setBaseUrl,
     modelName,
     setModelName,
-    useGeminiNative,
-    setUseGeminiNative,
     mode,
     setMode,
-    imageSize,
-    setImageSize,
-    aspectRatio,
-    setAspectRatio,
+    sizeConfig,
+    setSizeConfig,
+    sourceSize,
     generateCount,
     setGenerateCount,
     regions = [],
@@ -42,7 +41,6 @@ export function ControlPanel({
 }) {
     const [showSettings, setShowSettings] = React.useState(false);
     const [copyHint, setCopyHint] = React.useState('');
-    const [customSize, setCustomSize] = React.useState('');
 
     // 自定义模型管理
     const [customModels, setCustomModels] = React.useState(() => {
@@ -98,8 +96,19 @@ export function ControlPanel({
         'nano-banana-2',
         'nano-banana-2-2k',
         'nano-banana-2-4k',
-        'nano-banana'
+        'nano-banana',
+        'gpt-image-2.5',
+        'gpt-image-2'
     ];
+
+    // 尺寸校验（与 SizeControl 使用同一套规则）；非法时禁用生成按钮
+    const sizeCheck = resolveOutputSize({
+        config: sizeConfig,
+        model: modelName,
+        mode,
+        sourceSize,
+    });
+    const sizeInvalid = sizeCheck.errors.length > 0;
 
     const copyToClipboard = async (text) => {
         if (!text) return false;
@@ -295,18 +304,6 @@ export function ControlPanel({
                             </div>
                         )}
                     </div>
-                    <div className="space-y-2">
-                        <label className="flex items-center gap-2 cursor-pointer">
-                            <input
-                                type="checkbox"
-                                checked={useGeminiNative}
-                                onChange={(e) => setUseGeminiNative(e.target.checked)}
-                                className="w-4 h-4 rounded border-gray-300 text-slate-600 focus:ring-2 focus:ring-slate-400"
-                            />
-                            <span className="text-xs font-bold uppercase tracking-widest text-slate-500">使用 Gemini 原生 API</span>
-                        </label>
-                        <p className="text-xs text-slate-400">勾选后使用 Gemini 原生格式，否则使用 OpenAI 格式</p>
-                    </div>
                 </div>
             )}
 
@@ -332,138 +329,34 @@ export function ControlPanel({
                     </button>
                 </div>
 
+                <SizeControl
+                    config={sizeConfig}
+                    onChange={setSizeConfig}
+                    modelName={modelName}
+                    mode={mode}
+                    sourceSize={sourceSize}
+                />
+
                 {mode === 'generate' && (
-                    <>
-                        <div className="space-y-2">
-                            <label className="text-xs font-bold uppercase tracking-widest text-slate-500">图片尺寸</label>
-                            <select
-                                value={imageSize}
-                                onChange={(e) => setImageSize(e.target.value)}
-                                className="w-full px-3 py-2 bg-white/80 rounded-lg border border-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-slate-400"
-                            >
-                                <option value="1024x1024">1K（1024×1024）</option>
-                                <option value="2048x2048">2K（2048×2048）</option>
-                                <option value="4096x4096">4K（4096×4096）</option>
-                            </select>
+                    <div className="space-y-2">
+                        <label className="text-xs font-bold uppercase tracking-widest text-slate-500">数量</label>
+                        <div className="flex gap-2">
+                            {[1, 2, 3, 4].map((count) => (
+                                <button
+                                    key={count}
+                                    onClick={() => setGenerateCount(count)}
+                                    className={cn(
+                                        "flex-1 px-4 py-2 rounded-lg text-sm font-medium transition-all duration-200",
+                                        generateCount === count
+                                            ? "bg-gradient-to-br from-red-400 to-red-500 text-white shadow-md"
+                                            : "bg-white/80 text-gray-700 border border-gray-200 hover:bg-gray-50"
+                                    )}
+                                >
+                                    {count}
+                                </button>
+                            ))}
                         </div>
-
-                        <div className="space-y-2">
-                            <label className="text-xs font-bold uppercase tracking-widest text-slate-500">自定义尺寸（可选）</label>
-                            <input
-                                type="text"
-                                value={customSize}
-                                placeholder="例如: 800:800 或留空使用上方预设"
-                                className="w-full px-3 py-2 bg-white/80 rounded-lg border border-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-slate-400"
-                                onChange={(e) => {
-                                    setCustomSize(e.target.value);
-                                    if (e.target.value.trim()) {
-                                        setImageSize(e.target.value.trim());
-                                    }
-                                }}
-                            />
-                            <p className="text-xs text-slate-400">格式: 宽:高 (如 800:800)，留空则使用上方预设</p>
-                        </div>
-
-                        <div className="space-y-2">
-                            <label className="text-xs font-bold uppercase tracking-widest text-slate-500">宽高比</label>
-                            <select
-                                value={aspectRatio}
-                                onChange={(e) => setAspectRatio(e.target.value)}
-                                className="w-full px-3 py-2 bg-white/80 rounded-lg border border-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-slate-400"
-                            >
-                                <option value="1:1">1:1（方形）</option>
-                                <option value="16:9">16:9（宽屏横向）</option>
-                                <option value="9:16">9:16（手机竖向）</option>
-                                <option value="4:3">4:3（传统横向）</option>
-                                <option value="3:4">3:4（传统竖向）</option>
-                                <option value="21:9">21:9（超宽屏）</option>
-                                <option value="9:21">9:21（超长竖向）</option>
-                                <option value="3:2">3:2（相机横向）</option>
-                                <option value="2:3">2:3（相机竖向）</option>
-                                <option value="5:4">5:4（近方形横向）</option>
-                                <option value="4:5">4:5（近方形竖向）</option>
-                            </select>
-                        </div>
-
-                        <div className="space-y-2">
-                            <label className="text-xs font-bold uppercase tracking-widest text-slate-500">数量</label>
-                            <div className="flex gap-2">
-                                {[1, 2, 3, 4].map((count) => (
-                                    <button
-                                        key={count}
-                                        onClick={() => setGenerateCount(count)}
-                                        className={cn(
-                                            "flex-1 px-4 py-2 rounded-lg text-sm font-medium transition-all duration-200",
-                                            generateCount === count
-                                                ? "bg-gradient-to-br from-red-400 to-red-500 text-white shadow-md"
-                                                : "bg-white/80 text-gray-700 border border-gray-200 hover:bg-gray-50"
-                                        )}
-                                    >
-                                        {count}
-                                    </button>
-                                ))}
-                            </div>
-                        </div>
-                    </>
-                )}
-
-                {mode === 'edit' && (
-                    <>
-                        <div className="space-y-2">
-                            <label className="text-xs font-bold uppercase tracking-widest text-slate-500">图片尺寸</label>
-                            <select
-                                value={imageSize}
-                                onChange={(e) => setImageSize(e.target.value)}
-                                className="w-full px-3 py-2 bg-white/80 rounded-lg border border-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-slate-400"
-                            >
-                                <option value="1024x1024">1K（1024×1024）</option>
-                                <option value="2048x2048">2K（2048×2048）</option>
-                                <option value="4096x4096">4K（4096×4096）</option>
-                                {/* 如果当前尺寸不是预设值，显示自定义选项 */}
-                                {imageSize && !['1024x1024', '2048x2048', '4096x4096'].includes(imageSize) && (
-                                    <option value={imageSize}>自定义（{imageSize.replace(':', '×')}）</option>
-                                )}
-                            </select>
-                        </div>
-
-                        <div className="space-y-2">
-                            <label className="text-xs font-bold uppercase tracking-widest text-slate-500">自定义尺寸（可选）</label>
-                            <input
-                                type="text"
-                                value={customSize}
-                                placeholder="例如: 800:800 或留空使用上方预设"
-                                className="w-full px-3 py-2 bg-white/80 rounded-lg border border-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-slate-400"
-                                onChange={(e) => {
-                                    setCustomSize(e.target.value);
-                                    if (e.target.value.trim()) {
-                                        setImageSize(e.target.value.trim());
-                                    }
-                                }}
-                            />
-                            <p className="text-xs text-slate-400">格式: 宽:高 (如 800:800)，留空则使用上方预设</p>
-                        </div>
-
-                        <div className="space-y-2">
-                            <label className="text-xs font-bold uppercase tracking-widest text-slate-500">宽高比</label>
-                            <select
-                                value={aspectRatio}
-                                onChange={(e) => setAspectRatio(e.target.value)}
-                                className="w-full px-3 py-2 bg-white/80 rounded-lg border border-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-slate-400"
-                            >
-                                <option value="1:1">1:1（方形）</option>
-                                <option value="16:9">16:9（宽屏横向）</option>
-                                <option value="9:16">9:16（手机竖向）</option>
-                                <option value="4:3">4:3（传统横向）</option>
-                                <option value="3:4">3:4（传统竖向）</option>
-                                <option value="21:9">21:9（超宽屏）</option>
-                                <option value="9:21">9:21（超长竖向）</option>
-                                <option value="3:2">3:2（相机横向）</option>
-                                <option value="2:3">2:3（相机竖向）</option>
-                                <option value="5:4">5:4（近方形横向）</option>
-                                <option value="4:5">4:5（近方形竖向）</option>
-                            </select>
-                        </div>
-                    </>
+                    </div>
                 )}
 
                 {/* 编辑模式：保留原图选项 */}
@@ -610,7 +503,7 @@ export function ControlPanel({
 
                 <Button
                     onClick={onGenerate}
-                    disabled={isGenerating || !prompt}
+                    disabled={isGenerating || !prompt || sizeInvalid}
                     className="w-full h-14 text-lg shadow-soft-spread"
                 >
                     {isGenerating ? (

@@ -1,8 +1,37 @@
+import { parseSize } from './imageSize.js';
 
 export const API_CONFIG = {
     baseUrl: 'https://foxi-ai.top', // Default, can be overridden
     apiKey: '', // User must provide
     timeoutMs: 300_000, // 300 秒
+};
+
+/**
+ * 本地代理路径：由 vite 开发服务器（dev-api-proxy.js）提供服务端转发，
+ * 从而绕过第三方接口未开启 CORS 导致浏览器 fetch 直接失败的问题。
+ */
+const PROXY_PATH = '/api-proxy';
+
+/**
+ * 规范化用户填写的接口地址：
+ * - 自动补全 https://
+ * - 去掉结尾多余的 /
+ * - 去掉误填的 /v1、/v1beta 后缀
+ */
+export const normalizeBaseUrl = (value) => {
+    let base = String(value ?? '').trim();
+    if (!base) return '';
+    if (!/^https?:\/\//i.test(base)) base = `https://${base}`;
+    return base.replace(/\/+$/, '').replace(/\/v1(beta)?$/i, '');
+};
+
+/** 从 URL 中取出主机名，用于错误提示 */
+const describeHost = (url) => {
+    try {
+        return new URL(url, 'http://localhost').host || url;
+    } catch {
+        return url;
+    }
 };
 
 const fetchWithTimeout = async (url, options = {}, timeoutMs = API_CONFIG.timeoutMs) => {
@@ -15,16 +44,126 @@ const fetchWithTimeout = async (url, options = {}, timeoutMs = API_CONFIG.timeou
         if (err?.name === 'AbortError') {
             throw new Error(`请求超时（${Math.round(timeoutMs / 1000)}秒）`);
         }
-        // 浏览器网络层错误（例如 net::ERR_CONNECTION_CLOSED / CORS 阻止 / 断网）通常会表现为 TypeError: Failed to fetch
+        // 浏览器网络层错误（例如 net::ERR_CONNECTION_CLOSED / CORS 阻止 / 证书错误 / 断网）通常表现为 TypeError: Failed to fetch
         if (err instanceof TypeError) {
             throw new Error(
-                '网络请求失败：连接被中断（可能是服务端主动断开、网络/代理不稳定、或请求体过大导致网关重置连接）。'
+                `网络请求失败：无法连接接口服务（${describeHost(url)}）。` +
+                '常见原因：接口地址填写错误、接口域名与 HTTPS 证书不匹配、接口服务未开启跨域(CORS)，或网络/代理中断。' +
+                '请先在“设置”中确认接口地址；如果是静态部署，还需要为该地址配置同源反向代理。'
             );
         }
         throw err;
     } finally {
         clearTimeout(timer);
     }
+};
+
+/** 读取接口返回的错误信息（兼容 OpenAI / new-api / 自定义网关的多种格式） */
+const readErrorMessage = async (response, fallback) => {
+    let text = '';
+    try {
+        text = await response.text();
+    } catch {
+        // ignore
+    }
+    if (!text) return `${fallback}（HTTP ${response.status}）`;
+    try {
+        const data = JSON.parse(text);
+        const message =
+            data?.error?.message ||
+            data?.message ||
+            (typeof data?.error === 'string' ? data.error : '') ||
+            data?.error?.code ||
+            data?.code;
+        if (message) return `${message}（HTTP ${response.status}）`;
+    } catch {
+        // 不是 JSON，继续按纯文本处理
+    }
+    return `${fallback}（HTTP ${response.status}）：${text.slice(0, 200)}`;
+};
+
+// 是否可以使用本地代理：undefined = 还没探测过，true = 可用，false = 不可用（回退直连）
+let proxySupported;
+
+/**
+ * 判断响应是不是“静态托管把未知路径回退到了 index.html”。
+ * 这种情况说明当前部署没有配置 /api-proxy 反向代理，需要回退为浏览器直连。
+ */
+const isSpaFallbackResponse = async (response) => {
+    const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+    if (!contentType.includes('text/html')) return false;
+    try {
+        const text = await response.clone().text();
+        return /<div id="root">/i.test(text) || /\/src\/main\.jsx/.test(text);
+    } catch {
+        return false;
+    }
+};
+
+/**
+ * 统一的接口请求入口：
+ * 1) 优先走本地代理（同源，无跨域问题）
+ * 2) 如果当前环境没有代理（例如纯静态部署），自动回退为浏览器直连
+ */
+const fetchApi = async (path, { method = 'GET', headers = {}, body, baseUrl, timeoutMs } = {}) => {
+    const base = normalizeBaseUrl(baseUrl || API_CONFIG.baseUrl);
+    if (!base) {
+        throw new Error('未配置接口地址：请先在“设置”中填写接口地址（例如 https://api.example.com）');
+    }
+
+    const direct = () => fetchWithTimeout(`${base}${path}`, { method, headers, body }, timeoutMs);
+
+    if (proxySupported !== false) {
+        let proxied;
+        try {
+            proxied = await fetchWithTimeout(
+                `${PROXY_PATH}${path}`,
+                { method, headers: { ...headers, 'X-Api-Base': base }, body },
+                timeoutMs
+            );
+        } catch (err) {
+            if (err?.message?.startsWith('请求超时')) throw err;
+            // 同一个源下的代理路由都连不上，说明没有本地代理，退回直连
+            if (proxySupported === undefined) {
+                proxySupported = false;
+                return direct();
+            }
+            throw err;
+        }
+
+        if (proxied.headers.get('x-api-proxy') === '1') {
+            proxySupported = true;
+            return proxied;
+        }
+
+        // 有代理标记，或返回的不是 SPA 回退页面，都说明请求确实经过了代理
+        if (proxied.headers.get('x-api-proxy') === '1' || !(await isSpaFallbackResponse(proxied))) {
+            proxySupported = true;
+            return proxied;
+        }
+
+        // 说明该路径不存在（静态托管把未知路径回退成了 index.html）
+        proxySupported = false;
+    }
+
+    return direct();
+};
+
+/** 代理一个绝对地址（主要用于把返回的图片 URL 下载成 base64，避免图片跨域） */
+const proxyFetch = async (absoluteUrl) => {
+    if (proxySupported !== false) {
+        try {
+            const response = await fetch(`${PROXY_PATH}?url=${encodeURIComponent(absoluteUrl)}`);
+            if (response.headers.get('x-api-proxy') === '1' || !(await isSpaFallbackResponse(response))) {
+                proxySupported = true;
+                return response;
+            }
+            proxySupported = false;
+        } catch {
+            proxySupported = false;
+        }
+    }
+    return fetch(absoluteUrl);
 };
 
 const isLikelyBase64 = (value) => {
@@ -57,7 +196,7 @@ const base64ToBlob = (base64, mimeType = 'image/png') => {
  */
 const fetchImageAsBase64 = async (imageUrl) => {
     try {
-        const response = await fetch(imageUrl);
+        const response = await proxyFetch(imageUrl);
         if (!response.ok) throw new Error(`Failed to fetch image: ${response.status}`);
 
         const blob = await response.blob();
@@ -79,8 +218,6 @@ const fetchImageAsBase64 = async (imageUrl) => {
 };
 
 export async function uploadFile({ dataUrl, apiKey, baseUrl, filename = 'upload.png' }) {
-    const url = `${baseUrl || API_CONFIG.baseUrl}/v1/files`;
-
     // 支持传入 data:image/... 或 https://...
     if (typeof dataUrl !== 'string' || dataUrl.length === 0) {
         throw new Error('上传失败：缺少文件数据');
@@ -95,103 +232,23 @@ export async function uploadFile({ dataUrl, apiKey, baseUrl, filename = 'upload.
     const formData = new FormData();
     formData.append('file', base64ToBlob(parsed.base64, parsed.mimeType), filename);
 
-    const response = await fetchWithTimeout(url, {
+    const response = await fetchApi('/v1/files', {
         method: 'POST',
         headers: {
             'Authorization': `Bearer ${apiKey || API_CONFIG.apiKey}`
         },
-        body: formData
+        body: formData,
+        baseUrl
     });
 
     if (!response.ok) {
-        let message = '文件上传失败';
-        try {
-            const err = await response.json();
-            message = err.error?.message || message;
-        } catch {
-            // ignore
-        }
-        throw new Error(message);
+        throw new Error(await readErrorMessage(response, '文件上传失败'));
     }
 
     const data = await response.json();
     if (!data?.url) throw new Error('文件上传失败：响应中缺少 url');
     return data; // { id, url, ... }
 }
-
-/**
- * Extract base64 image from Gemini Native API response
- * Response format: { candidates: [{ content: { parts: [{ inlineData: { mimeType, data } }] } }] }
- */
-const extractBase64ImageFromGeminiNative = async (payload) => {
-    try {
-        // Try to extract from candidates[0].content.parts
-        const parts = payload?.candidates?.[0]?.content?.parts;
-        if (Array.isArray(parts)) {
-            for (const part of parts) {
-                // Check for inlineData (base64 image)
-                const inlineData = part?.inlineData;
-                if (inlineData?.data && inlineData?.mimeType) {
-                    return {
-                        mimeType: inlineData.mimeType,
-                        base64: inlineData.data
-                    };
-                }
-
-                // Check for text content that might contain image URL or base64
-                const text = part?.text;
-                if (typeof text === 'string') {
-                    // Try to parse as data URL
-                    const asDataUrl = parseDataUrl(text);
-                    if (asDataUrl) return asDataUrl;
-
-                    // Check if it's a markdown image link
-                    const markdownMatch = text.match(/!\[.*?\]\((https?:\/\/[^)]+)\)/);
-                    if (markdownMatch) {
-                        const imageUrl = markdownMatch[1];
-                        console.log('Gemini returned external image URL, downloading:', imageUrl);
-
-                        try {
-                            // Fetch the image from URL
-                            const response = await fetch(imageUrl);
-                            if (!response.ok) {
-                                throw new Error(`Failed to fetch image: ${response.statusText}`);
-                            }
-
-                            // Convert to blob
-                            const blob = await response.blob();
-
-                            // Convert blob to base64
-                            const base64 = await new Promise((resolve, reject) => {
-                                const reader = new FileReader();
-                                reader.onloadend = () => {
-                                    const dataUrl = reader.result;
-                                    const base64Data = dataUrl.split(',')[1];
-                                    resolve(base64Data);
-                                };
-                                reader.onerror = reject;
-                                reader.readAsDataURL(blob);
-                            });
-
-                            return {
-                                mimeType: blob.type || 'image/jpeg',
-                                base64: base64
-                            };
-                        } catch (fetchError) {
-                            console.error('Failed to download image from URL:', fetchError);
-                            throw new Error(`无法下载图片: ${fetchError.message}`);
-                        }
-                    }
-                }
-            }
-        }
-    } catch (err) {
-        console.error('Error extracting image from Gemini native response:', err);
-        throw err;
-    }
-
-    return null;
-};
 
 const extractBase64ImageFromChat = (payload) => {
     // Try common shapes (provider variations)
@@ -269,315 +326,134 @@ export const fileToBase64 = (file) => {
     });
 };
 
-/**
- * Call the Gemini Image Generation API
- * Supports both OpenAI format and Gemini native format
- */
-export async function generateImage({ prompt, aspectRatio = '1:1', apiKey, baseUrl, model, size = '1024x1024', useGeminiNative = false }) {
-    if (useGeminiNative) {
-        // Gemini Native API format
-        const url = `${baseUrl || API_CONFIG.baseUrl}/v1beta/models/${model || 'gemini-2.5-flash-image'}:generateContent`;
-
-        const response = await fetchWithTimeout(url, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${apiKey || API_CONFIG.apiKey}`
-            },
-            body: JSON.stringify({
-                contents: [
-                    {
-                        role: "user",
-                        parts: [{ text: prompt }]
-                    }
-                ],
-                generationConfig: {
-                    responseModalities: ["image"],
-                    imageConfig: {
-                        aspectRatio: aspectRatio,
-                        imageSize: size
-                    }
-                }
-            })
-        });
-
-        if (!response.ok) {
-            const err = await response.json();
-            throw new Error(err.error?.message || '生成失败');
-        }
-
-        const data = await response.json();
-
-        // Extract image from Gemini native response
-        const extracted = await extractBase64ImageFromGeminiNative(data);
-        if (!extracted) throw new Error('生成失败：未从响应中解析到图片数据');
-
-        return {
-            data: [{
-                b64_json: extracted.base64
-            }]
-        };
-    } else {
-        // OpenAI format
-        const url = `${baseUrl || API_CONFIG.baseUrl}/v1/images/generations`;
-
-        // Build request body
-        const requestBody = {
-            prompt,
-            model: model || "gemini-2.5-flash-image",
-            n: 1,
-            size: size,
-            aspect_ratio: aspectRatio,
-            response_format: "b64_json"
-        };
-
-        // Add extra_body for additional image config if needed
-        if (aspectRatio || size) {
-            requestBody.extra_body = {
-                google: {
-                    image_config: {}
-                }
-            };
-
-            if (aspectRatio) {
-                requestBody.extra_body.google.image_config.aspect_ratio = aspectRatio;
-            }
-
-            if (size) {
-                requestBody.extra_body.google.image_config.image_size = size;
-            }
-        }
-
-        const response = await fetchWithTimeout(url, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${apiKey || API_CONFIG.apiKey}`
-            },
-            body: JSON.stringify(requestBody)
-        });
-
-        if (!response.ok) {
-            const err = await response.json();
-            throw new Error(err.error?.message || '生成失败');
-        }
-
-        return await response.json();
-    }
-}
+/** 把 "800:800" / "800x800" / "800×800" / "1K" 等写法统一成 { width, height } */
+const normalizePixelSize = (size) => parseSize(size);
 
 /**
- * 使用 OpenAI Chat Completions 格式的"绘图模型"（例如 gemini-3-pro-image-preview）
- * 说明：不同服务商返回图片的字段可能不同，这里做了尽可能兼容的解析。
- * 支持 Gemini 原生格式和 OpenAI 格式
+ * Call the image generation API (OpenAI-compatible format)
+ *
+ * GPT Image 系列（gpt-image-2 / gpt-image-2.5）只接受 `size: "WIDTHxHEIGHT"`，
+ * 不接受 `aspect_ratio` / `response_format`，也不认 Gemini 的 `extra_body.google`，
+ * 所以这里只发 prompt / model / n / size，避免被网关以“未知参数”拒绝。
  */
-export async function generateImageViaChatCompletions({ prompt, apiKey, baseUrl, model, aspectRatio = '1:1', imageSize = '', useGeminiNative = false, referenceImages = [] }) {
-    if (useGeminiNative) {
-        // Gemini Native API format
-        const url = `${baseUrl || API_CONFIG.baseUrl}/v1beta/models/${model}:generateContent`;
+export async function generateImage({ prompt, apiKey, baseUrl, model, size }) {
+    const pixelSize = normalizePixelSize(size);
 
-        // 构建 parts 数组
-        const parts = [{ text: prompt }];
+    // Build request body
+    const requestBody = {
+        prompt,
+        // 兜底用官方 ID（`gpt-image-2.5` 只是网关别名，见 docs/gpt-image-2.5-size-rules.md）
+        model: model || 'gpt-image-2.5-flare',
+        n: 1,
+    };
 
-        // 添加参考图
-        referenceImages.forEach(ref => {
-            parts.push({
-                inlineData: {
-                    mimeType: ref.mimeType,
-                    data: ref.base64
-                }
-            });
-        });
-
-        const response = await fetchWithTimeout(url, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${apiKey || API_CONFIG.apiKey}`
-            },
-            body: JSON.stringify({
-                contents: [
-                    {
-                        role: "user",
-                        parts: parts
-                    }
-                ],
-                generationConfig: {
-                    responseModalities: ["image"],
-                    imageConfig: {
-                        aspectRatio: aspectRatio,
-                        imageSize: imageSize || "800:800"
-                    }
-                }
-            })
-        });
-
-        if (!response.ok) {
-            const err = await response.json();
-            throw new Error(err.error?.message || '生成失败');
-        }
-
-        const data = await response.json();
-        const extracted = await extractBase64ImageFromGeminiNative(data);
-        if (!extracted) throw new Error('生成失败：未从响应中解析到图片数据');
-        return extracted; // { mimeType, base64 }
-    } else {
-        // OpenAI format
-        const url = `${baseUrl || API_CONFIG.baseUrl}/v1/chat/completions`;
-
-        // Build content array with prompt and reference images
-        const content = [{ type: 'text', text: prompt }];
-
-        // Add reference images
-        referenceImages.forEach(ref => {
-            content.push({
-                type: 'image_url',
-                image_url: { url: `data:${ref.mimeType};base64,${ref.base64}` }
-            });
-        });
-
-        // Build request body
-        const requestBody = {
-            model,
-            stream: false,
-            messages: [
-                {
-                    role: 'user',
-                    content: content
-                }
-            ]
-        };
-
-        // Add extra_body for Google image config
-        if (aspectRatio || imageSize) {
-            requestBody.extra_body = {
-                google: {
-                    image_config: {}
-                }
-            };
-
-            if (aspectRatio) {
-                requestBody.extra_body.google.image_config.aspect_ratio = aspectRatio;
-            }
-
-            if (imageSize) {
-                requestBody.extra_body.google.image_config.image_size = imageSize;
-            }
-        }
-
-        const response = await fetchWithTimeout(url, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${apiKey || API_CONFIG.apiKey}`
-            },
-            body: JSON.stringify(requestBody)
-        });
-
-        if (!response.ok) {
-            const err = await response.json();
-            throw new Error(err.error?.message || '生成失败');
-        }
-
-        const data = await response.json();
-        const extracted = extractBase64ImageFromChat(data);
-        if (!extracted) throw new Error('生成失败：未从响应中解析到图片数据');
-
-        // If extracted contains a URL instead of base64, fetch and convert it
-        if (extracted.url && !extracted.base64) {
-            const fetched = await fetchImageAsBase64(extracted.url);
-            return fetched; // { mimeType, base64 }
-        }
-
-        return extracted; // { mimeType, base64 }
-    }
-}
-
-/**
- * Edit image using Gemini Native API format
- */
-async function editImageViaGeminiNative({ imageDataUrl, maskDataUrl, prompt, apiKey, baseUrl, model, referenceImages = [], aspectRatio = '1:1', imageSize = '' }) {
-    const url = `${baseUrl || API_CONFIG.baseUrl}/v1beta/models/${model}:generateContent`;
-
-    // 解析图片数据
-    const imageParsed = parseDataUrl(imageDataUrl);
-    if (!imageParsed) throw new Error('无效的图片数据');
-
-    // 构建 parts 数组
-    const parts = [{ text: prompt }];
-
-    // 添加原图
-    parts.push({
-        inlineData: {
-            mimeType: imageParsed.mimeType,
-            data: imageParsed.base64
-        }
-    });
-
-    // 如果有遮罩，添加遮罩图
-    if (maskDataUrl) {
-        const maskParsed = parseDataUrl(maskDataUrl);
-        if (maskParsed) {
-            parts.push({
-                inlineData: {
-                    mimeType: maskParsed.mimeType,
-                    data: maskParsed.base64
-                }
-            });
-        }
+    if (pixelSize) {
+        requestBody.size = `${pixelSize.width}x${pixelSize.height}`;
     }
 
-    // 添加参考图
-    referenceImages.forEach(ref => {
-        parts.push({
-            inlineData: {
-                mimeType: ref.mimeType,
-                data: ref.base64
-            }
-        });
-    });
-
-    const response = await fetchWithTimeout(url, {
+    const response = await fetchApi('/v1/images/generations', {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
             'Authorization': `Bearer ${apiKey || API_CONFIG.apiKey}`
         },
-        body: JSON.stringify({
-            contents: [{
-                role: "user",
-                parts: parts
-            }],
-            generationConfig: {
-                responseModalities: ["image"],
-                imageConfig: {
-                    aspectRatio: aspectRatio,
-                    imageSize: imageSize || "1024x1024"
-                }
-            }
-        })
+        body: JSON.stringify(requestBody),
+        baseUrl
     });
 
     if (!response.ok) {
-        const err = await response.json();
-        throw new Error(err.error?.message || '编辑失败');
+        throw new Error(await readErrorMessage(response, '生成失败'));
     }
 
     const data = await response.json();
-    const extracted = await extractBase64ImageFromGeminiNative(data);
-    if (!extracted) throw new Error('编辑失败：未从响应中解析到图片数据');
+
+    // 有些服务商返回的是图片 URL 而不是 b64_json，这里统一转换成 base64
+    const first = data?.data?.[0];
+    const imageUrl = first?.url || first?.image_url;
+    if (first && !first.b64_json && imageUrl) {
+        const fetched = await fetchImageAsBase64(imageUrl);
+        return { ...data, data: [{ ...first, b64_json: fetched.base64 }] };
+    }
+
+    return data;
+}
+
+/**
+ * 使用 OpenAI Chat Completions 格式的"绘图模型"（例如 gemini-3-pro-image-preview）
+ * 说明：不同服务商返回图片的字段可能不同，这里做了尽可能兼容的解析。
+ */
+export async function generateImageViaChatCompletions({ prompt, apiKey, baseUrl, model, aspectRatio = '1:1', imageSize = '', referenceImages = [] }) {
+    const url = '/v1/chat/completions';
+
+    // Build content array with prompt and reference images
+    const content = [{ type: 'text', text: prompt }];
+
+    // Add reference images
+    referenceImages.forEach(ref => {
+        content.push({
+            type: 'image_url',
+            image_url: { url: `data:${ref.mimeType};base64,${ref.base64}` }
+        });
+    });
+
+    // Build request body
+    const requestBody = {
+        model,
+        stream: false,
+        messages: [
+            {
+                role: 'user',
+                content: content
+            }
+        ]
+    };
+
+    // Add extra_body for Google image config
+    if (aspectRatio || imageSize) {
+        requestBody.extra_body = {
+            google: {
+                image_config: {}
+            }
+        };
+
+        if (aspectRatio) {
+            requestBody.extra_body.google.image_config.aspect_ratio = aspectRatio;
+        }
+
+        if (imageSize) {
+            requestBody.extra_body.google.image_config.image_size = imageSize;
+        }
+    }
+
+    const response = await fetchApi(url, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey || API_CONFIG.apiKey}`
+        },
+        body: JSON.stringify(requestBody),
+        baseUrl
+    });
+
+    if (!response.ok) {
+        throw new Error(await readErrorMessage(response, '生成失败'));
+    }
+
+    const data = await response.json();
+    const extracted = extractBase64ImageFromChat(data);
+    if (!extracted) throw new Error('生成失败：未从响应中解析到图片数据');
+
+    // If extracted contains a URL instead of base64, fetch and convert it
+    if (extracted.url && !extracted.base64) {
+        const fetched = await fetchImageAsBase64(extracted.url);
+        return fetched; // { mimeType, base64 }
+    }
 
     return extracted; // { mimeType, base64 }
 }
 
-export async function editImageViaChatCompletions({ imageDataUrl, maskDataUrl, prompt, apiKey, baseUrl, model, useGeminiNative = false, referenceImages = [], aspectRatio = '1:1', imageSize = '' }) {
-    // 如果使用 Gemini 原生格式，调用专门的函数
-    if (useGeminiNative) {
-        return editImageViaGeminiNative({ imageDataUrl, maskDataUrl, prompt, apiKey, baseUrl, model, referenceImages, aspectRatio, imageSize });
-    }
-
-    // 否则使用 OpenAI 格式
-    const url = `${baseUrl || API_CONFIG.baseUrl}/v1/chat/completions`;
+export async function editImageViaChatCompletions({ imageDataUrl, maskDataUrl, prompt, apiKey, baseUrl, model, referenceImages = [], aspectRatio = null, imageSize = null }) {
+    const url = '/v1/chat/completions';
 
     // 根据是否有遮罩，构建不同的指令和内容
     let instruction;
@@ -621,27 +497,41 @@ export async function editImageViaChatCompletions({ imageDataUrl, maskDataUrl, p
         });
     });
 
-    const response = await fetchWithTimeout(url, {
+    // Gemini / nano-banana 通过 chat.completions 的 extra_body 传比例与档位；
+    // 不传（例如界面里的“沿用原图”）时由模型自行决定
+    const requestBody = {
+        model,
+        stream: false,
+        messages: [
+            {
+                role: 'user',
+                content: content
+            }
+        ]
+    };
+
+    if (aspectRatio || imageSize) {
+        requestBody.extra_body = {
+            google: {
+                image_config: {}
+            }
+        };
+        if (aspectRatio) requestBody.extra_body.google.image_config.aspect_ratio = aspectRatio;
+        if (imageSize) requestBody.extra_body.google.image_config.image_size = imageSize;
+    }
+
+    const response = await fetchApi(url, {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
             'Authorization': `Bearer ${apiKey || API_CONFIG.apiKey}`
         },
-        body: JSON.stringify({
-            model,
-            stream: false,
-            messages: [
-                {
-                    role: 'user',
-                    content: content
-                }
-            ]
-        })
+        body: JSON.stringify(requestBody),
+        baseUrl
     });
 
     if (!response.ok) {
-        const err = await response.json();
-        throw new Error(err.error?.message || '编辑失败');
+        throw new Error(await readErrorMessage(response, '编辑失败'));
     }
 
     const data = await response.json();
@@ -661,13 +551,16 @@ export async function editImageViaChatCompletions({ imageDataUrl, maskDataUrl, p
  * Call the Image Edit API using OpenAI-compatible format
  * According to API docs: /v1/images/edits with multipart/form-data
  * Sends image and mask as separate file uploads
+ *
+ * `size` 可选：不传则由接口按原图/auto 输出（对应界面里的“沿用原图”）。
+ * 注意 GPT Image 的编辑接口不支持 response_format，图片始终以 b64_json 返回。
  */
-export async function editImage({ imageBase64, maskBase64, prompt, apiKey, baseUrl, model, imageMimeType = 'image/png' }) {
-    const url = `${baseUrl || API_CONFIG.baseUrl}/v1/images/edits`;
+export async function editImage({ imageBase64, maskBase64, prompt, apiKey, baseUrl, model, imageMimeType = 'image/png', size }) {
+    const url = '/v1/images/edits';
 
     // Create FormData
     const formData = new FormData();
-    formData.append('model', model || 'nano-banana');
+    formData.append('model', model || 'gpt-image-2.5-flare');
     formData.append('prompt', prompt);
 
     // Append image files
@@ -675,25 +568,36 @@ export async function editImage({ imageBase64, maskBase64, prompt, apiKey, baseU
     const maskBlob = base64ToBlob(maskBase64);
 
     formData.append('image', imageBlob, 'image.png');
-    formData.append('image', maskBlob, 'mask.png');
+    formData.append('mask', maskBlob, 'mask.png');
 
-    formData.append('response_format', 'b64_json');
+    const pixelSize = normalizePixelSize(size);
+    if (pixelSize) {
+        formData.append('size', `${pixelSize.width}x${pixelSize.height}`);
+    }
 
-    const response = await fetchWithTimeout(url, {
+    const response = await fetchApi(url, {
         method: 'POST',
         headers: {
             'Authorization': `Bearer ${apiKey || API_CONFIG.apiKey}`
             // Don't set Content-Type - browser will set it with boundary
         },
-        body: formData
+        body: formData,
+        baseUrl
     });
 
     if (!response.ok) {
-        const err = await response.json();
-        throw new Error(err.error?.message || '编辑失败');
+        throw new Error(await readErrorMessage(response, '编辑失败'));
     }
 
     const data = await response.json();
-    // Return base64 image data
-    return data.data?.[0]?.b64_json;
+
+    // 有的服务商返回 url 而不是 b64_json，这里兼容成 b64_json（调用方只认 b64_json）
+    const first = data?.data?.[0];
+    const imageUrl = first?.url || first?.image_url;
+    if (first && !first.b64_json && imageUrl) {
+        const fetched = await fetchImageAsBase64(imageUrl);
+        return { ...data, data: [{ ...first, b64_json: fetched.base64 }] };
+    }
+
+    return data;
 }
