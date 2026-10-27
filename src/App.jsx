@@ -15,6 +15,13 @@ import {
 import { removeImageBackground } from './lib/backgroundRemoval';
 import { extractByMask } from './lib/maskExtraction';
 import { isChatImageModel, migrateLegacySizeConfig, normalizeSizeConfig, resolveOutputSize } from './lib/imageSize';
+import {
+  cropImageToDataUrl,
+  resizeImageToDataUrl,
+  splitDataUrl,
+  validateCropRect,
+  validateTargetSize,
+} from './lib/imageTools';
 
 function App() {
   // 图层管理
@@ -381,6 +388,80 @@ function App() {
     img.src = layer.url;
   };
 
+  // 替换某个图层的像素（供画布上的裁剪 / 拉伸工具使用）
+  const replaceLayerImage = React.useCallback((layerId, updates) => {
+    const { mimeType, base64 } = splitDataUrl(updates.url);
+    setLayers((prev) => prev.map((layer) => (
+      layer.id === layerId
+        ? { ...layer, ...updates, mimeType, base64 }
+        : layer
+    )));
+  }, []);
+
+  // 画布裁剪工具回调：把选中图层裁剪到指定像素区域，并让裁剪结果保持在画布原来的位置
+  const handleCropLayer = React.useCallback(async ({ layerId, rect, x, y }) => {
+    const layer = layers.find((item) => item.id === layerId);
+    if (!layer) {
+      alert('图层不存在，可能已被删除');
+      return;
+    }
+
+    const check = validateCropRect(rect, { width: layer.width, height: layer.height });
+    if (!check.ok) {
+      alert(`裁剪区域不合法：${check.errors.join('；')}`);
+      return;
+    }
+
+    try {
+      const result = await cropImageToDataUrl(layer.url, check.rect);
+      replaceLayerImage(layer.id, {
+        url: result.dataUrl,
+        width: result.width,
+        height: result.height,
+        x: Number.isFinite(x) ? x : layer.x,
+        y: Number.isFinite(y) ? y : layer.y,
+      });
+    } catch (err) {
+      console.error('裁剪失败:', err);
+      alert(`裁剪失败：${err.message}`);
+    }
+  }, [layers, replaceLayerImage]);
+
+  // 画布拉伸工具回调：把拖拽缩放后的显示尺寸固化成新的图片像素尺寸
+  const handleStretchLayer = React.useCallback(async ({ layerId, width, height, x, y }) => {
+    const layer = layers.find((item) => item.id === layerId);
+    if (!layer) {
+      alert('图层不存在，可能已被删除');
+      return;
+    }
+
+    const check = validateTargetSize(
+      { width, height },
+      { sourceSize: { width: layer.width, height: layer.height } }
+    );
+    if (!check.ok) {
+      alert(`目标尺寸不合法：${check.errors.join('；')}`);
+      return;
+    }
+
+    try {
+      const result = await resizeImageToDataUrl(layer.url, check.size);
+      replaceLayerImage(layer.id, {
+        url: result.dataUrl,
+        width: result.width,
+        height: result.height,
+        x: Number.isFinite(x) ? x : layer.x,
+        y: Number.isFinite(y) ? y : layer.y,
+        // 像素尺寸已经是拉伸后的结果，显示缩放归位到 1
+        scaleX: 1,
+        scaleY: 1,
+      });
+    } catch (err) {
+      console.error('拉伸失败:', err);
+      alert(`拉伸失败：${err.message}`);
+    }
+  }, [layers, replaceLayerImage]);
+
   // 处理拖拽上传
   const handleDrop = async (e) => {
     e.preventDefault();
@@ -538,7 +619,7 @@ function App() {
 
         // 检查是否有绘制的遮罩
         const canvas = canvasRef.current;
-        const objects = canvas?.getObjects().filter(obj => !obj.layerId) || [];
+        const objects = canvas?.getObjects().filter(obj => !obj.layerId && !obj.isCanvasOverlay) || [];
         const hasMask = objects.length > 0;
 
         let maskDataUrl = null;
@@ -701,7 +782,7 @@ function App() {
         // 清除画布上的遮罩绘制
         const canvas = canvasRef.current;
         if (canvas) {
-          const objects = canvas.getObjects().filter(obj => !obj.layerId);
+          const objects = canvas.getObjects().filter(obj => !obj.layerId && !obj.isCanvasOverlay);
           objects.forEach(obj => canvas.remove(obj));
           canvas.requestRenderAll();
         }
@@ -740,8 +821,8 @@ function App() {
     const imgWidth = selectedLayer.width;
     const imgHeight = selectedLayer.height;
 
-    // 获取所有绘制对象（不包括图层）
-    const objects = canvas.getObjects().filter(obj => !obj.layerId);
+    // 获取所有绘制对象（不包括图层与图像工具的叠加层）
+    const objects = canvas.getObjects().filter(obj => !obj.layerId && !obj.isCanvasOverlay);
     if (objects.length === 0) throw new Error('请先绘制遮罩区域');
 
     // 获取选中图层的 Fabric 对象，用于计算相对坐标
@@ -984,6 +1065,8 @@ function App() {
           onAddLayer={addLayer}
           isSelectingReference={isSelectingReference}
           onAddReferenceImage={addReferenceImage}
+          onCropLayer={handleCropLayer}
+          onStretchLayer={handleStretchLayer}
         />
       </div>
     </Layout>

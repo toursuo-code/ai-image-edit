@@ -1,8 +1,35 @@
 import React, { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { Canvas, Image as FabricImage, Path, PencilBrush, Rect } from 'fabric';
-import { Eraser, MousePointer2, Pencil, Redo2, Square, Trash2, Undo2, Lasso, ChevronDown, X, Sparkles } from 'lucide-react';
+import { Crop, Eraser, MousePointer2, Pencil, Redo2, Scaling, Square, Trash2, Undo2, Lasso, ChevronDown, X, Sparkles } from 'lucide-react';
 import { Button } from './ui/Button';
 import { findNearestEdge } from '../lib/edgeDetection';
+import {
+    computeStretchInfo,
+    intersectBounds,
+    normalizeAngleDelta,
+    sceneBoundsToImageRect,
+} from '../lib/canvasImageTools';
+
+const CROP_DIM_COLOR = 'rgba(15, 23, 42, 0.5)';
+
+/** 创建画布叠加层对象（裁剪框 / 遮暗区域），统一打上标记，避免被当成遮罩或进入撤销历史 */
+function createOverlayRect(options = {}) {
+    const rect = new Rect({
+        originX: 'left',
+        originY: 'top',
+        left: 0,
+        top: 0,
+        width: 0,
+        height: 0,
+        strokeWidth: 0,
+        selectable: false,
+        evented: false,
+        objectCaching: false,
+        ...options,
+    });
+    rect.isCanvasOverlay = true;
+    return rect;
+}
 
 export function CanvasEditor({
     layers = [],
@@ -22,6 +49,8 @@ export function CanvasEditor({
     onAddLayer,
     isSelectingReference,
     onAddReferenceImage,
+    onCropLayer,
+    onStretchLayer,
 }) {
     const canvasRef = useRef(null);
     const containerRef = useRef(null);
@@ -56,6 +85,14 @@ export function CanvasEditor({
     const nextRegionIdRef = useRef(1);
     const nextLayerIdRef = useRef(1);
     const layersMapRef = useRef(new Map()); // layerId -> FabricImage object
+
+    // 画布图像工具：裁剪（裁剪框 + 遮暗层）与拉伸（拖拽缩放后固化像素尺寸）
+    const [cropInfo, setCropInfo] = useState(null);
+    const cropStateRef = useRef(null);
+
+    const [stretchInfo, setStretchInfo] = useState(null);
+    const stretchStateRef = useRef(null);
+    const stretchCommitRef = useRef(false);
 
     // Lasso tool state
     const [showLassoDropdown, setShowLassoDropdown] = useState(false);
@@ -199,7 +236,9 @@ export function CanvasEditor({
     };
 
     const snapshotObjects = (canvas) =>
-        canvas.getObjects().map(obj => obj.toObject(['selectable', 'evented', 'regionId', 'layerId', 'maskLayerId']));
+        canvas.getObjects()
+            .filter((obj) => !obj.isCanvasOverlay)
+            .map(obj => obj.toObject(['selectable', 'evented', 'regionId', 'layerId', 'maskLayerId']));
 
     const syncRegions = () => {
         if (!fabricCanvas) return;
@@ -229,7 +268,7 @@ export function CanvasEditor({
         let maxId = 0;
         const regions = fabricCanvas
             .getObjects()
-            .filter(obj => obj?.type === 'rect' && !obj.layerId) // 只同步绘制的矩形，不包括图层
+            .filter(obj => obj?.type === 'rect' && !obj.layerId && !obj.isCanvasOverlay) // 只同步绘制的矩形，不包括图层/工具叠加层
             .map((obj) => {
                 if (!obj.regionId) {
                     obj.regionId = nextRegionIdRef.current++;
@@ -450,6 +489,8 @@ export function CanvasEditor({
 
         const onKeyDown = (e) => {
             if (isTypingTarget(e.target)) return;
+            // 裁剪 / 拉伸模式由各自的面板处理 Enter / Esc，避免撤销、删除等快捷键误操作
+            if (drawMode === 'crop' || drawMode === 'stretch') return;
 
             const isMod = e.ctrlKey || e.metaKey;
             const key = (e.key || '').toLowerCase();
@@ -623,8 +664,16 @@ export function CanvasEditor({
         setFabricCanvas(canvas);
         onCanvasReady?.(canvas);
 
+        // 开发模式下暴露 Fabric 实例，供 E2E 测试与控制台调试使用（生产构建中会被移除）
+        if (import.meta.env.DEV) {
+            window.__fabricCanvasForTest = canvas;
+        }
+
         return () => {
             if (pointerRafRef.current) cancelAnimationFrame(pointerRafRef.current);
+            if (import.meta.env.DEV && window.__fabricCanvasForTest === canvas) {
+                delete window.__fabricCanvasForTest;
+            }
             canvas.dispose();
         };
         // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1198,6 +1247,286 @@ export function CanvasEditor({
         if (nextHandlers.pathCreated) fabricCanvas.on('path:created', nextHandlers.pathCreated);
     }, [fabricCanvas, drawMode, isDrawing, brushSize]);
 
+    // ===== 画布图像工具：裁剪 / 拉伸 =====
+
+    const cancelImageTool = React.useCallback(() => {
+        setIsDrawing?.(false);
+        setDrawMode('select');
+    }, [setDrawMode, setIsDrawing]);
+
+    const applyCropFromCanvas = React.useCallback(() => {
+        const state = cropStateRef.current;
+        if (!state) return;
+
+        const { layerObj, cropRect, layerBounds } = state;
+        if (normalizeAngleDelta(layerObj.angle) > 0.01) {
+            alert('裁剪暂不支持旋转后的图层：请先把图层旋转回 0° 再裁剪');
+            return;
+        }
+        const flipped = Boolean(layerObj.flipX) || Number(layerObj.scaleX) < 0
+            || Boolean(layerObj.flipY) || Number(layerObj.scaleY) < 0;
+        if (flipped) {
+            alert('裁剪暂不支持翻转后的图层：请先翻回原方向再裁剪');
+            return;
+        }
+
+        const cropBounds = intersectBounds(cropRect.getBoundingRect(), layerBounds);
+        const imageRect = cropBounds ? sceneBoundsToImageRect(layerObj, cropBounds) : null;
+        if (!imageRect) {
+            alert('裁剪框和图片没有交集，请拖动裁剪框覆盖图片区域');
+            return;
+        }
+        if (imageRect.width < 2 || imageRect.height < 2) {
+            alert('裁剪区域太小，请把裁剪框拉大一些');
+            return;
+        }
+
+        setDrawMode('select');
+        onCropLayer?.({
+            layerId: layerObj.layerId,
+            rect: imageRect,
+            x: cropBounds.left,
+            y: cropBounds.top,
+        });
+    }, [onCropLayer, setDrawMode]);
+
+    const applyStretchFromCanvas = React.useCallback(() => {
+        const state = stretchStateRef.current;
+        if (!state?.layerObj) return;
+
+        const info = computeStretchInfo(state.layerObj);
+        if (!info.ok) {
+            alert(`无法应用拉伸：${info.errors.join('；')}`);
+            return;
+        }
+        if (!info.changed) return;
+
+        stretchCommitRef.current = true;
+        setIsDrawing?.(false);
+        setDrawMode('select');
+        onStretchLayer?.({
+            layerId: state.layerObj.layerId,
+            width: info.width,
+            height: info.height,
+            x: state.layerObj.left,
+            y: state.layerObj.top,
+        });
+    }, [onStretchLayer, setDrawMode, setIsDrawing]);
+
+    // 裁剪模式：在选中图层上创建可拖动 / 缩放的裁剪框，并压暗框外区域
+    useEffect(() => {
+        if (!fabricCanvas || drawMode !== 'crop') return undefined;
+
+        const layerObj = fabricCanvas.getObjects().find((obj) => obj.layerId === selectedLayerId);
+        if (!layerObj) {
+            setDrawMode('select');
+            return undefined;
+        }
+
+        const layerBounds = layerObj.getBoundingRect();
+        const dimRects = [0, 1, 2, 3].map(() => createOverlayRect({ fill: CROP_DIM_COLOR, visible: false }));
+        const cropRect = createOverlayRect({
+            left: layerBounds.left,
+            top: layerBounds.top,
+            width: layerBounds.width,
+            height: layerBounds.height,
+            fill: 'rgba(59, 130, 246, 0.06)',
+            stroke: '#2563eb',
+            strokeWidth: 1.5,
+            strokeDashArray: [6, 4],
+            strokeUniform: true,
+            borderColor: '#2563eb',
+            borderScaleFactor: 1.5,
+            hasBorders: false,
+            cornerColor: '#ffffff',
+            cornerStrokeColor: '#2563eb',
+            transparentCorners: false,
+            cornerSize: 12,
+            lockRotation: true,
+            lockScalingFlip: true,
+            padding: 0,
+            selectable: true,
+            evented: true,
+        });
+        cropRect.setControlsVisibility({ mtr: false });
+
+        cropStateRef.current = { layerObj, layerBounds, cropRect, dimRects };
+
+        fabricCanvas.add(...dimRects);
+        fabricCanvas.add(cropRect);
+        cropRect.setCoords();
+        fabricCanvas.setActiveObject(cropRect);
+
+        const clampToLayer = (value, min, max) => Math.min(max, Math.max(min, value));
+
+        // 四条压暗矩形拼出「框外压暗」；裁剪框超出图片时按图片范围裁剪遮罩
+        const updateDimRects = (cropBounds) => {
+            const layerRight = layerBounds.left + layerBounds.width;
+            const layerBottom = layerBounds.top + layerBounds.height;
+            const top = clampToLayer(cropBounds.top, layerBounds.top, layerBottom);
+            const bottom = clampToLayer(cropBounds.top + cropBounds.height, layerBounds.top, layerBottom);
+            const left = clampToLayer(cropBounds.left, layerBounds.left, layerRight);
+            const right = clampToLayer(cropBounds.left + cropBounds.width, layerBounds.left, layerRight);
+
+            const positions = [
+                { left: layerBounds.left, top: layerBounds.top, width: layerBounds.width, height: top - layerBounds.top },
+                { left: layerBounds.left, top: bottom, width: layerBounds.width, height: layerBottom - bottom },
+                { left: layerBounds.left, top, width: left - layerBounds.left, height: bottom - top },
+                { left: right, top, width: layerRight - right, height: bottom - top },
+            ];
+
+            dimRects.forEach((rect, index) => {
+                const position = positions[index];
+                const visible = position.width > 0.5 && position.height > 0.5;
+                rect.set({
+                    left: position.left,
+                    top: position.top,
+                    width: Math.max(0, position.width),
+                    height: Math.max(0, position.height),
+                    visible,
+                });
+                rect.setCoords();
+            });
+        };
+
+        const report = () => {
+            const cropBounds = cropRect.getBoundingRect();
+            updateDimRects(cropBounds);
+
+            const rotated = normalizeAngleDelta(layerObj.angle) > 0.01;
+            const flipped = Boolean(layerObj.flipX) || Number(layerObj.scaleX) < 0
+                || Boolean(layerObj.flipY) || Number(layerObj.scaleY) < 0;
+            const blockedReason = rotated
+                ? '裁剪暂不支持旋转后的图层，请先旋转回 0°'
+                : flipped
+                    ? '裁剪暂不支持翻转后的图层，请先翻回原方向'
+                    : '';
+            const intersection = blockedReason ? null : intersectBounds(cropBounds, layerBounds);
+            const imageRect = intersection ? sceneBoundsToImageRect(layerObj, intersection) : null;
+
+            setCropInfo({ rect: imageRect, blockedReason });
+        };
+
+        const onObjectChanged = (event) => {
+            if (event.target === cropRect) report();
+        };
+        // 点击裁剪框外的空白区域时保持裁剪框选中，手柄不会突然消失
+        const onSelectionCleared = () => {
+            if (!cropStateRef.current) return;
+            if (!fabricCanvas.getActiveObject()) {
+                fabricCanvas.setActiveObject(cropRect);
+                fabricCanvas.requestRenderAll();
+            }
+        };
+
+        fabricCanvas.on('object:moving', onObjectChanged);
+        fabricCanvas.on('object:scaling', onObjectChanged);
+        fabricCanvas.on('object:modified', onObjectChanged);
+        fabricCanvas.on('selection:cleared', onSelectionCleared);
+
+        report();
+        fabricCanvas.requestRenderAll();
+
+        return () => {
+            fabricCanvas.off('object:moving', onObjectChanged);
+            fabricCanvas.off('object:scaling', onObjectChanged);
+            fabricCanvas.off('object:modified', onObjectChanged);
+            fabricCanvas.off('selection:cleared', onSelectionCleared);
+            cropStateRef.current = null;
+            setCropInfo(null);
+            [cropRect, ...dimRects].forEach((obj) => fabricCanvas.remove(obj));
+            fabricCanvas.discardActiveObject();
+            fabricCanvas.requestRenderAll();
+        };
+    }, [fabricCanvas, drawMode, selectedLayerId, setDrawMode]);
+
+    // 拉伸模式：只允许拖拽当前图层的控制柄；取消时恢复原变换，应用时把缩放固化成像素尺寸
+    useEffect(() => {
+        if (!fabricCanvas || drawMode !== 'stretch') return undefined;
+
+        const layerObj = fabricCanvas.getObjects().find((obj) => obj.layerId === selectedLayerId);
+        if (!layerObj) {
+            setDrawMode('select');
+            return undefined;
+        }
+
+        const original = {
+            left: layerObj.left,
+            top: layerObj.top,
+            scaleX: layerObj.scaleX,
+            scaleY: layerObj.scaleY,
+        };
+        stretchCommitRef.current = false;
+        stretchStateRef.current = { layerObj };
+
+        setAllObjectsSelectable(fabricCanvas, false);
+        layerObj.set({ selectable: true, evented: true, lockScalingFlip: true });
+        layerObj.setCoords();
+        fabricCanvas.setActiveObject(layerObj);
+        fabricCanvas.requestRenderAll();
+
+        const report = () => {
+            setStretchInfo(computeStretchInfo(layerObj));
+        };
+
+        const onObjectChanged = (event) => {
+            if (event.target === layerObj) report();
+        };
+
+        fabricCanvas.on('object:scaling', onObjectChanged);
+        fabricCanvas.on('object:modified', onObjectChanged);
+        report();
+
+        return () => {
+            fabricCanvas.off('object:scaling', onObjectChanged);
+            fabricCanvas.off('object:modified', onObjectChanged);
+            setStretchInfo(null);
+            stretchStateRef.current = null;
+            layerObj.set({ lockScalingFlip: false });
+
+            if (!stretchCommitRef.current) {
+                // 取消 / 切换模式：把拖拽产生的缩放还原，避免留下“没应用”的变形
+                layerObj.set({
+                    left: original.left,
+                    top: original.top,
+                    scaleX: original.scaleX,
+                    scaleY: original.scaleY,
+                });
+                layerObj.setCoords();
+                fabricCanvas.requestRenderAll();
+                // 触发已有的 object:modified 监听，把位置/缩放同步回父组件
+                fabricCanvas.fire('object:modified', { target: layerObj });
+            }
+            stretchCommitRef.current = false;
+        };
+    }, [fabricCanvas, drawMode, selectedLayerId, setDrawMode]);
+
+    // 裁剪 / 拉伸模式的键盘操作：Esc 取消，Enter 应用
+    useEffect(() => {
+        if (!fabricCanvas) return undefined;
+        if (drawMode !== 'crop' && drawMode !== 'stretch') return undefined;
+
+        const onKeyDown = (event) => {
+            const target = event.target;
+            const tag = (target?.tagName || '').toLowerCase();
+            if (tag === 'input' || tag === 'textarea' || target?.isContentEditable) return;
+
+            if (event.key === 'Escape') {
+                event.preventDefault();
+                cancelImageTool();
+                return;
+            }
+            if (event.key === 'Enter') {
+                event.preventDefault();
+                if (drawMode === 'crop') applyCropFromCanvas();
+                else applyStretchFromCanvas();
+            }
+        };
+
+        window.addEventListener('keydown', onKeyDown);
+        return () => window.removeEventListener('keydown', onKeyDown);
+    }, [fabricCanvas, drawMode, cancelImageTool, applyCropFromCanvas, applyStretchFromCanvas]);
+
     // 监听对象变化（移动/缩放等）同步区域列表和图层信息
     useEffect(() => {
         if (!fabricCanvas) return;
@@ -1332,6 +1661,8 @@ export function CanvasEditor({
     // Sync layer panel selection to canvas selection
     useEffect(() => {
         if (!fabricCanvas) return;
+        // 裁剪 / 拉伸模式由工具自己管理画布选中对象，避免抢走裁剪框 / 控制柄
+        if (drawMode === 'crop' || drawMode === 'stretch') return;
 
         // Find the object with the selected layer ID
         const objects = fabricCanvas.getObjects();
@@ -1346,7 +1677,7 @@ export function CanvasEditor({
             fabricCanvas.discardActiveObject();
             fabricCanvas.requestRenderAll();
         }
-    }, [fabricCanvas, selectedLayerId]);
+    }, [fabricCanvas, selectedLayerId, drawMode]);
 
     // Generate mask layer from lasso selection
     const generateMaskFromLasso = useCallback(() => {
@@ -1582,7 +1913,13 @@ export function CanvasEditor({
         }
 
         if (isRestoring) parts.push('回撤中…');
-        if (!isDrawing && drawMode !== 'select') parts.push('绘制未启用（点击左侧按钮或点工具自动启用）');
+        if (drawMode === 'crop') {
+            parts.push('裁剪：拖动 / 缩放裁剪框 · Enter 应用 · Esc 取消');
+        } else if (drawMode === 'stretch') {
+            parts.push('拉伸：拖拽控制柄改变尺寸 · Enter 应用 · Esc 取消');
+        } else if (!isDrawing && drawMode !== 'select') {
+            parts.push('绘制未启用（点击左侧按钮或点工具自动启用）');
+        }
         parts.push('空格拖拽平移 · 滚轮缩放');
         return parts.join('  ·  ');
     }, [pointer, zoom, rectInfo, isRestoring, isDrawing, drawMode, sceneToRelativeCoords]);
@@ -1664,6 +2001,72 @@ export function CanvasEditor({
                             />
                             <span className="text-xs font-medium text-slate-900 w-8">{brushSize}</span>
                         </div>
+                    </div>
+                )}
+
+                {drawMode === 'crop' && (
+                    <div className="flex items-center gap-3 px-4 py-2 bg-white/95 backdrop-blur-glass-60 rounded-full shadow-lg border border-white/50">
+                        <span className="text-xs font-medium text-slate-600">
+                            {cropInfo?.blockedReason ? (
+                                <span className="text-amber-600">{cropInfo.blockedReason}</span>
+                            ) : cropInfo?.rect ? (
+                                <>
+                                    裁剪尺寸{' '}
+                                    <span className="font-semibold tabular-nums text-slate-900">
+                                        {cropInfo.rect.width} × {cropInfo.rect.height}
+                                    </span>{' '}
+                                    px
+                                </>
+                            ) : (
+                                '把裁剪框拖到图片范围内'
+                            )}
+                        </span>
+                        <Button size="sm" variant="secondary" className="rounded-full" onClick={cancelImageTool}>
+                            取消
+                        </Button>
+                        <Button
+                            size="sm"
+                            className="rounded-full"
+                            onClick={applyCropFromCanvas}
+                            disabled={!cropInfo?.rect}
+                        >
+                            应用裁剪
+                        </Button>
+                    </div>
+                )}
+
+                {drawMode === 'stretch' && (
+                    <div className="flex items-center gap-3 px-4 py-2 bg-white/95 backdrop-blur-glass-60 rounded-full shadow-lg border border-white/50">
+                        <span className="text-xs font-medium text-slate-600">
+                            {stretchInfo?.errors?.length ? (
+                                <span className="text-red-500">{stretchInfo.errors[0]}</span>
+                            ) : (
+                                <>
+                                    输出尺寸{' '}
+                                    <span className="font-semibold tabular-nums text-slate-900">
+                                        {stretchInfo?.width ?? '—'} × {stretchInfo?.height ?? '—'}
+                                    </span>{' '}
+                                    px
+                                    {stretchInfo?.ratioChanged && (
+                                        <span className="text-amber-600">（比例已改变，会变形）</span>
+                                    )}
+                                    {stretchInfo?.warnings?.length > 0 && (
+                                        <span className="text-amber-600">（{stretchInfo.warnings[0]}）</span>
+                                    )}
+                                </>
+                            )}
+                        </span>
+                        <Button size="sm" variant="secondary" className="rounded-full" onClick={cancelImageTool}>
+                            取消
+                        </Button>
+                        <Button
+                            size="sm"
+                            className="rounded-full"
+                            onClick={applyStretchFromCanvas}
+                            disabled={!stretchInfo?.ok || !stretchInfo?.changed}
+                        >
+                            应用拉伸
+                        </Button>
                     </div>
                 )}
 
@@ -1770,6 +2173,46 @@ export function CanvasEditor({
                             </div>
                         )}
                     </div>
+
+                    <div className="w-px h-6 bg-gray-300 mx-1" />
+
+                    {/* 裁剪：在画布上拖出裁剪框，确认后裁掉框外内容 */}
+                    <Button
+                        variant={drawMode === 'crop' ? 'primary' : 'ghost'}
+                        size="icon"
+                        onClick={() => {
+                            if (!selectedLayerId) {
+                                alert('请先选择一个图层再裁剪');
+                                return;
+                            }
+                            setDrawMode('crop');
+                            setIsDrawing?.(false);
+                        }}
+                        disabled={!selectedLayerId}
+                        className="rounded-full w-10 h-10"
+                        title="裁剪：拖出裁剪框，Enter 应用 / Esc 取消"
+                    >
+                        <Crop size={18} />
+                    </Button>
+
+                    {/* 拉伸：拖拽控制柄改变尺寸，确认后把缩放固化成新的像素尺寸 */}
+                    <Button
+                        variant={drawMode === 'stretch' ? 'primary' : 'ghost'}
+                        size="icon"
+                        onClick={() => {
+                            if (!selectedLayerId) {
+                                alert('请先选择一个图层再拉伸');
+                                return;
+                            }
+                            setDrawMode('stretch');
+                            setIsDrawing?.(false);
+                        }}
+                        disabled={!selectedLayerId}
+                        className="rounded-full w-10 h-10"
+                        title="拉伸：拖拽手柄改变图片尺寸，Enter 应用 / Esc 取消"
+                    >
+                        <Scaling size={18} />
+                    </Button>
 
                     {/* Background Removal Tool */}
                     <Button
